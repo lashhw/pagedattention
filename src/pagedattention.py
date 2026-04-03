@@ -105,8 +105,8 @@ def _paged_attention_decode_kernel(
     stride_oh,
     stride_od,
     softmax_scale,
-    BLOCK_TOKENS: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     q_head_idx = tl.program_id(0)
     kv_head_idx = q_head_idx // num_kv_groups
@@ -114,15 +114,15 @@ def _paged_attention_decode_kernel(
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sl)
     num_blocks = tl.cdiv(seqlen, block_size)
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_t = tl.arange(0, BLOCK_TOKENS)
+    offs_t = tl.arange(0, BLOCK_T)
+    offs_d = tl.arange(0, BLOCK_D)
 
     q_ptrs = q_ptr + q_head_idx * stride_qh + offs_d * stride_qd
     q = tl.load(q_ptrs, mask=offs_d < head_size, other=0.0).to(tl.float32)
 
     m_i = -float("inf")
     l_i = 0.0
-    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for logical_block_idx in tl.range(0, num_blocks):
         physical_block_idx = tl.load(block_table_ptr + kv_head_idx * stride_bth + logical_block_idx * stride_btb)
@@ -169,15 +169,15 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
     num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     block_size = k_cache.shape[1]
-    block_dmodel = triton.next_power_of_2(head_size)
+    block_d = triton.next_power_of_2(head_size)
 
     q_heads = q[0, 0].contiguous()
     cache_seqlens_heads = cache_seqlens[0].contiguous()
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
-    block_tokens = triton.next_power_of_2(block_size)
-    num_warps = 4 if block_dmodel <= 128 else 8
+    block_t = triton.next_power_of_2(block_size)
+    num_warps = 4 if block_d <= 128 else 8
 
     grid = (num_query_heads,)
     _paged_attention_decode_kernel[grid](
@@ -204,8 +204,8 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         out.stride(0),
         out.stride(1),
         softmax_scale,
-        BLOCK_TOKENS=block_tokens,
-        BLOCK_DMODEL=block_dmodel,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
         num_warps=num_warps,
         num_stages=1,
     )
