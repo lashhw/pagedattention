@@ -3,7 +3,23 @@ import triton
 import triton.language as tl
 
 
-def _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table):
+"""
+Interface for flash_attn_with_kvcache_wrapper
+
+Args:
+    q: Query tensor of shape (batch_size, 1, num_query_heads, head_size)
+    k_cache: KV cache for keys of shape (num_blocks, block_size, head_size)
+    v_cache: KV cache for values of shape (num_blocks, block_size, head_size)
+    cache_seqlens: Sequence lengths of shape (batch_size, num_kv_heads)
+    block_table: Block table mapping of shape (batch_size, num_kv_heads, max_num_blocks_per_head)
+    softmax_scale: Scaling factor for attention scores
+
+Returns:
+    Output tensor of shape (batch_size, 1, num_query_heads, head_size)
+"""
+
+
+def _validate_decode_inputs(q, cache_seqlens, block_table):
     assert q.shape[0] == 1
     assert cache_seqlens.shape[0] == 1
     assert block_table.shape[0] == 1
@@ -43,19 +59,7 @@ def _materialize_kvcache(k_cache, v_cache, cache_seqlens, block_table):
 
 
 def flash_attn_with_kvcache_wrapper_eager(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
-    """
-    Args:
-        q: Query tensor of shape (batch_size, 1, num_query_heads, head_size)
-        k_cache: KV cache for keys of shape (num_blocks, block_size, head_size)
-        v_cache: KV cache for values of shape (num_blocks, block_size, head_size)
-        cache_seqlens: Sequence lengths of shape (batch_size, num_kv_heads)
-        block_table: Block table mapping of shape (batch_size, num_kv_heads, max_num_blocks_per_head)
-        softmax_scale: Scaling factor for attention scores
-
-    Returns:
-        Output tensor of shape (batch_size, 1, num_query_heads, head_size)
-    """
-    _, num_kv_heads, num_kv_groups, _ = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
+    _, num_kv_heads, num_kv_groups, _ = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     q = q.transpose(1, 2).contiguous()
     k_heads, v_heads = _materialize_kvcache(k_cache, v_cache, cache_seqlens, block_table)
@@ -163,7 +167,7 @@ def _paged_attention_decode_kernel(
 
 
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
-    num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
+    num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     block_size = k_cache.shape[1]
     block_dmodel = triton.next_power_of_2(head_size)
