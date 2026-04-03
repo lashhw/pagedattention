@@ -10,10 +10,8 @@ pytest.importorskip("triton")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pagedattention import (  # noqa: E402
-    flash_attn_with_kvcache_wrapper_eager,
-    flash_attn_with_kvcache_wrapper_triton,
-)
+from pagedattention_eager import flash_attn_with_kvcache_wrapper_eager
+from pagedattention_triton import flash_attn_with_kvcache_wrapper_triton
 
 
 pytestmark = pytest.mark.skipif(
