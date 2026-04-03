@@ -63,7 +63,8 @@ def _build_decode_inputs(
     ("dtype", "block_size", "head_size", "num_kv_heads", "num_kv_groups", "seqlens", "seed", "atol", "rtol"),
     [
         (torch.float16, 16, 64, 2, 2, [9, 27], 0, 2e-2, 2e-2),
-        (torch.float32, 32, 96, 3, 1, [7, 35, 50], 1, 5e-4, 5e-4),
+        (torch.float32, 16, 96, 3, 1, [7, 35, 50], 1, 5e-4, 5e-4),
+        (torch.float16, 16, 128, 2, 4, [16, 193], 2, 3e-2, 3e-2),
     ],
 )
 def test_flash_attn_with_kvcache_wrapper_triton_matches_eager(
