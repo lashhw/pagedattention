@@ -14,7 +14,9 @@ def _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table):
     assert q_len == 1
     assert num_query_heads % num_kv_heads == 0
 
-    return num_query_heads, num_kv_heads, head_size
+    num_kv_groups = num_query_heads // num_kv_heads
+
+    return num_query_heads, num_kv_heads, num_kv_groups, head_size
 
 
 def _materialize_kvcache(k_cache, v_cache, cache_seqlens, block_table):
@@ -53,9 +55,8 @@ def flash_attn_with_kvcache_wrapper_eager(q, k_cache, v_cache, cache_seqlens, bl
     Returns:
         Output tensor of shape (batch_size, 1, num_query_heads, head_size)
     """
-    num_query_heads, num_kv_heads, _ = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
+    _, num_kv_heads, num_kv_groups, _ = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
 
-    num_kv_groups = num_query_heads // num_kv_heads
     q = q.transpose(1, 2).contiguous()
     k_heads, v_heads = _materialize_kvcache(k_cache, v_cache, cache_seqlens, block_table)
 
@@ -162,16 +163,10 @@ def _paged_attention_decode_kernel(
 
 
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
-    if q.device.type != "cuda":
-        raise RuntimeError("Triton paged attention requires CUDA tensors.")
+    num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
 
-    num_query_heads, num_kv_heads, head_size = _validate_decode_inputs(q, k_cache, v_cache, cache_seqlens, block_table)
-    num_kv_groups = num_query_heads // num_kv_heads
     block_size = k_cache.shape[1]
-
     block_dmodel = triton.next_power_of_2(head_size)
-    if block_dmodel > 256:
-        raise NotImplementedError(f"head_size={head_size} is not supported by the simple Triton kernel.")
 
     q_heads = q[0, 0].contiguous()
     cache_seqlens_heads = cache_seqlens[0].contiguous()
@@ -205,7 +200,7 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         block_table_heads.stride(1),
         out.stride(0),
         out.stride(1),
-        float(softmax_scale),
+        softmax_scale,
         BLOCK_TOKENS=block_tokens,
         BLOCK_DMODEL=block_dmodel,
         num_warps=num_warps,
