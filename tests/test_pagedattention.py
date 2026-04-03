@@ -14,7 +14,7 @@ from pagedattention_eager import flash_attn_with_kvcache_wrapper_eager
 from pagedattention_triton import flash_attn_with_kvcache_wrapper_triton
 
 
-pytestmark = pytest.mark.skipif(
+CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required to run the Triton paged-attention kernel.",
 )
@@ -63,9 +63,11 @@ def _build_decode_inputs(
     ("dtype", "block_size", "head_size", "num_kv_heads", "num_kv_groups", "seqlens", "seed", "atol", "rtol"),
     [
         (torch.float16, 16, 64, 2, 2, [9, 27], 0, 2e-2, 2e-2),
-        (torch.float32, 32, 96, 3, 1, [7, 35, 50], 1, 5e-4, 5e-4),
+        (torch.float32, 16, 96, 3, 1, [16, 32, 48], 1, 5e-4, 5e-4),
+        (torch.float32, 16, 80, 1, 4, [31], 2, 5e-4, 5e-4),
     ],
 )
+@CUDA_REQUIRED
 def test_flash_attn_with_kvcache_wrapper_triton_matches_eager(
     dtype,
     block_size,
@@ -106,3 +108,23 @@ def test_flash_attn_with_kvcache_wrapper_triton_matches_eager(
     )
 
     torch.testing.assert_close(triton_out, eager_out, atol=atol, rtol=rtol)
+
+
+def test_flash_attn_with_kvcache_wrapper_triton_requires_block_size_16():
+    head_size = 64
+    q = torch.randn((1, 1, 1, head_size), dtype=torch.float32)
+    k_cache = torch.randn((1, 32, head_size), dtype=torch.float32)
+    v_cache = torch.randn((1, 32, head_size), dtype=torch.float32)
+    cache_seqlens = torch.tensor([[7]], dtype=torch.int32)
+    block_table = torch.zeros((1, 1, 1), dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    with pytest.raises(AssertionError, match="block_size == 16"):
+        flash_attn_with_kvcache_wrapper_triton(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+        )

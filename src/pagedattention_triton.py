@@ -14,7 +14,6 @@ def _paged_attention_decode_kernel(
     block_table_ptr,
     out_ptr,
     num_kv_groups,
-    block_size,
     head_size,
     stride_qh,
     stride_qd,
@@ -30,39 +29,37 @@ def _paged_attention_decode_kernel(
     stride_oh,
     stride_od,
     softmax_scale,
-    BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     q_head_idx = tl.program_id(0)
     kv_head_idx = q_head_idx // num_kv_groups
 
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sl)
-    num_blocks = tl.cdiv(seqlen, block_size)
+    num_blocks = tl.cdiv(seqlen, 16)
 
-    offs_t = tl.arange(0, BLOCK_T)
+    offs_t = tl.arange(0, 16)
     offs_d = tl.arange(0, BLOCK_D)
+    head_mask = offs_d < head_size
 
     q_ptrs = q_ptr + q_head_idx * stride_qh + offs_d * stride_qd
-    q = tl.load(q_ptrs, mask=offs_d < head_size, other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=head_mask, other=0.0).to(tl.float32)
+    block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bth
+    k_block_offsets = offs_t[:, None] * stride_kt + offs_d[None, :] * stride_kd
+    v_block_offsets = offs_t[:, None] * stride_vt + offs_d[None, :] * stride_vd
 
     m_i = -float("inf")
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for logical_block_idx in tl.range(0, num_blocks):
-        physical_block_idx = tl.load(block_table_ptr + kv_head_idx * stride_bth + logical_block_idx * stride_btb)
+        physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_btb)
 
-        token_start = logical_block_idx * block_size
-        token_offsets = token_start + offs_t
+        token_offsets = logical_block_idx * 16 + offs_t
         token_mask = token_offsets < seqlen
+        kv_mask = token_mask[:, None] & head_mask[None, :]
 
-        k_ptrs = (
-            k_cache_ptr
-            + physical_block_idx * stride_kb
-            + offs_t[:, None] * stride_kt
-            + offs_d[None, :] * stride_kd
-        )
-        k = tl.load(k_ptrs, mask=token_mask[:, None] & (offs_d[None, :] < head_size), other=0.0).to(tl.float32)
+        k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
+        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
         logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
         logits = tl.where(token_mask, logits, -float("inf"))
 
@@ -72,13 +69,8 @@ def _paged_attention_decode_kernel(
         p = tl.exp(logits - m_new)
         p = tl.where(token_mask, p, 0.0)
 
-        v_ptrs = (
-            v_cache_ptr
-            + physical_block_idx * stride_vb
-            + offs_t[:, None] * stride_vt
-            + offs_d[None, :] * stride_vd
-        )
-        v = tl.load(v_ptrs, mask=token_mask[:, None] & (offs_d[None, :] < head_size), other=0.0).to(tl.float32)
+        v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
 
         acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -94,6 +86,7 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
     num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     block_size = k_cache.shape[1]
+    assert block_size == 16, "flash_attn_with_kvcache_wrapper_triton requires block_size == 16"
     block_d = triton.next_power_of_2(head_size)
 
     q_heads = q[0, 0].contiguous()
@@ -101,8 +94,7 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
-    block_t = triton.next_power_of_2(block_size)
-    num_warps = 4 if block_d <= 128 else 8
+    num_warps = 2 if block_d <= 128 else 4
 
     grid = (num_query_heads,)
     _paged_attention_decode_kernel[grid](
@@ -113,7 +105,6 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         block_table_heads,
         out,
         num_kv_groups,
-        block_size,
         head_size,
         q_heads.stride(0),
         q_heads.stride(1),
@@ -129,7 +120,6 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         out.stride(0),
         out.stride(1),
         softmax_scale,
-        BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=num_warps,
         num_stages=1,
