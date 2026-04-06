@@ -39,10 +39,10 @@ def _paged_attention_decode_kernel(
 
     offs_t = tl.arange(0, 16)
     offs_d = tl.arange(0, BLOCK_D)
-    head_mask = offs_d < head_size
+    mask_d = offs_d < head_size
 
     q_ptrs = q_ptr + q_head_idx * stride_qh + offs_d * stride_qd
-    q = tl.load(q_ptrs, mask=head_mask, other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
     block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bth
     k_block_offsets = offs_t[:, None] * stride_kt + offs_d[None, :] * stride_kd
     v_block_offsets = offs_t[:, None] * stride_vt + offs_d[None, :] * stride_vd
@@ -55,22 +55,22 @@ def _paged_attention_decode_kernel(
         physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_btb)
 
         token_offsets = logical_block_idx * 16 + offs_t
-        token_mask = token_offsets < seqlen
-        kv_mask = token_mask[:, None] & head_mask[None, :]
+        mask_t = token_offsets < seqlen
+        mask_kv = mask_t[:, None] & mask_d[None, :]
 
         k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
-        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=mask_kv, other=0.0).to(tl.float32)
         logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
-        logits = tl.where(token_mask, logits, -float("inf"))
+        logits = tl.where(mask_t, logits, -float("inf"))
 
         m_ij = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(logits - m_new)
-        p = tl.where(token_mask, p, 0.0)
+        p = tl.where(mask_t, p, 0.0)
 
         v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
-        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=mask_kv, other=0.0).to(tl.float32)
 
         acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
