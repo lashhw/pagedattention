@@ -56,7 +56,7 @@ def _paged_attention_decode_split_kernel(
     d_mask = d_offs < head_size
 
     q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
-    q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=d_mask, other=0.0)
 
     block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
     k_block_offsets = t_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd
@@ -75,9 +75,9 @@ def _paged_attention_decode_split_kernel(
         kv_mask = t_mask[:, None] & d_mask[None, :]
 
         k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
-        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
 
-        logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        logits = tl.sum(q[None, :] * k, axis=1, dtype=tl.float32) * softmax_scale
         logits = tl.where(t_mask, logits, -float("inf"))
 
         m_ij = tl.max(logits, axis=0)
@@ -86,13 +86,14 @@ def _paged_attention_decode_split_kernel(
 
         p = tl.exp(logits - m_new)
         p = tl.where(t_mask, p, 0.0)
+        p_16bit = p.to(q.dtype)
 
         v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
-        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
 
         m_i = m_new
         l_i = l_i * alpha + tl.sum(p, axis=0)
-        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        acc = acc * alpha + tl.sum(p_16bit[:, None] * v, axis=0, dtype=tl.float32)
 
     partial_m_ptrs = partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms
     partial_l_ptrs = partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls
