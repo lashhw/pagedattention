@@ -61,6 +61,7 @@ def _paged_attention_decode_kernel(
 
         k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
         k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
         logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
         logits = tl.where(t_mask, logits, -float("inf"))
 
