@@ -23,9 +23,9 @@ def _paged_attention_decode_kernel(
     stride_vb,
     stride_vt,
     stride_vd,
-    stride_sl,
-    stride_bth,
-    stride_btb,
+    stride_sh,
+    stride_bh,
+    stride_bb,
     stride_oh,
     stride_od,
     softmax_scale,
@@ -34,7 +34,7 @@ def _paged_attention_decode_kernel(
     q_head_idx = tl.program_id(0)
     kv_head_idx = q_head_idx // num_kv_groups
 
-    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sl)
+    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
     num_blocks = tl.cdiv(seqlen, 16)
 
     t_offs = tl.arange(0, 16)
@@ -44,7 +44,7 @@ def _paged_attention_decode_kernel(
     q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
     q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
 
-    block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bth
+    block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
     k_block_offsets = t_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd
     v_block_offsets = t_offs[:, None] * stride_vt + d_offs[None, :] * stride_vd
 
@@ -53,7 +53,7 @@ def _paged_attention_decode_kernel(
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for logical_block_idx in tl.range(0, num_blocks):
-        physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_btb)
+        physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_bb)
 
         token_offsets = logical_block_idx * 16 + t_offs
         t_mask = token_offsets < seqlen
