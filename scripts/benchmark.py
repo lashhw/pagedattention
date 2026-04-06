@@ -43,7 +43,7 @@ def _parse_args():
         "--seqlens",
         type=int,
         nargs="+",
-        default=[10000, 70000, 20000, 40000, 80000, 50000, 60000, 30000],
+        default=[100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000],
     )
     parser.add_argument(
         "--warmup",
