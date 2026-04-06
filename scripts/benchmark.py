@@ -34,6 +34,11 @@ def _parse_args():
         default=128,
     )
     parser.add_argument(
+        "--num_splits",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
         "--seqlens",
         type=int,
         nargs="+",
@@ -141,6 +146,7 @@ def main():
         "cache_seqlens": cache_seqlens,
         "block_table": block_table,
         "softmax_scale": 1.0 / math.sqrt(args.head_size),
+        "num_splits": args.num_splits,
     }
 
     eager_out = flash_attn_with_kvcache_wrapper_eager(**common_kwargs)
@@ -168,7 +174,7 @@ def main():
     print(
         "config: "
         f"num_kv_heads={args.num_kv_heads}, num_kv_groups={args.num_kv_groups}, "
-        f"block_size={args.block_size}, head_size={args.head_size}"
+        f"block_size={args.block_size}, head_size={args.head_size}, num_splits={args.num_splits}"
     )
     print(f"seqlens: {args.seqlens}")
     print(f"warmup={args.warmup}, iters={args.iters}, correctness={check_status}, max_abs_diff={max_abs_diff:.6f}")
