@@ -37,15 +37,16 @@ def _paged_attention_decode_kernel(
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sl)
     num_blocks = tl.cdiv(seqlen, 16)
 
-    offs_t = tl.arange(0, 16)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < head_size
+    t_offs = tl.arange(0, 16)
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < head_size
 
-    q_ptrs = q_ptr + q_head_idx * stride_qh + offs_d * stride_qd
-    q = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+    q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
+    q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+
     block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bth
-    k_block_offsets = offs_t[:, None] * stride_kt + offs_d[None, :] * stride_kd
-    v_block_offsets = offs_t[:, None] * stride_vt + offs_d[None, :] * stride_vd
+    k_block_offsets = t_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd
+    v_block_offsets = t_offs[:, None] * stride_vt + d_offs[None, :] * stride_vd
 
     m_i = -float("inf")
     l_i = 0.0
@@ -54,23 +55,23 @@ def _paged_attention_decode_kernel(
     for logical_block_idx in tl.range(0, num_blocks):
         physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_btb)
 
-        token_offsets = logical_block_idx * 16 + offs_t
-        mask_t = token_offsets < seqlen
-        mask_kv = mask_t[:, None] & mask_d[None, :]
+        token_offsets = logical_block_idx * 16 + t_offs
+        t_mask = token_offsets < seqlen
+        kv_mask = t_mask[:, None] & d_mask[None, :]
 
         k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
-        k = tl.load(k_ptrs, mask=mask_kv, other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
         logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
-        logits = tl.where(mask_t, logits, -float("inf"))
+        logits = tl.where(t_mask, logits, -float("inf"))
 
         m_ij = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(logits - m_new)
-        p = tl.where(mask_t, p, 0.0)
+        p = tl.where(t_mask, p, 0.0)
 
         v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
-        v = tl.load(v_ptrs, mask=mask_kv, other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
 
         acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -78,8 +79,8 @@ def _paged_attention_decode_kernel(
 
     denom = tl.where(l_i > 0, l_i, 1.0)
     out = acc / denom
-    out_ptrs = out_ptr + q_head_idx * stride_oh + offs_d * stride_od
-    tl.store(out_ptrs, out, mask=offs_d < head_size)
+    out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
+    tl.store(out_ptrs, out, mask=d_offs < head_size)
 
 
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
