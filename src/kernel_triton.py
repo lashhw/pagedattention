@@ -12,6 +12,7 @@ def _paged_attention_decode_kernel(
     v_cache_ptr,
     cache_seqlens_ptr,
     block_table_ptr,
+    softmax_scale,
     out_ptr,
     num_kv_groups,
     head_size,
@@ -28,7 +29,6 @@ def _paged_attention_decode_kernel(
     stride_bb,
     stride_oh,
     stride_od,
-    softmax_scale,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -86,7 +86,14 @@ def _paged_attention_decode_kernel(
     tl.store(out_ptrs, out, mask=d_mask)
 
 
-def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
+def flash_attn_with_kvcache_wrapper_triton(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens,
+    block_table,
+    softmax_scale,
+):
     num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     q_heads = q[0, 0].contiguous()
@@ -106,6 +113,7 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         v_cache,
         cache_seqlens_heads,
         block_table_heads,
+        softmax_scale,
         out,
         num_kv_groups,
         head_size,
@@ -122,7 +130,6 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         block_table_heads.stride(1),
         out.stride(0),
         out.stride(1),
-        softmax_scale,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=num_warps,
