@@ -12,9 +12,7 @@ from pagedattention_triton import flash_attn_with_kvcache_wrapper_triton
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="Benchmark paged attention Triton vs eager implementations.",
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--block_size",
         type=int,
@@ -129,9 +127,6 @@ def _benchmark(fn, *, warmup, iters, **kwargs):
 
 def main():
     args = _parse_args()
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to run this benchmark.")
 
     q, k_cache, v_cache, cache_seqlens, block_table = _build_decode_inputs(
         block_size=args.block_size,
