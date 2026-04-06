@@ -68,20 +68,21 @@ def _paged_attention_decode_kernel(
         m_ij = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_new)
+
         p = tl.exp(logits - m_new)
         p = tl.where(t_mask, p, 0.0)
 
         v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
         v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
 
-        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
         m_i = m_new
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
 
     denom = tl.where(l_i > 0, l_i, 1.0)
     out = acc / denom
     out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
-    tl.store(out_ptrs, out, mask=d_offs < head_size)
+    tl.store(out_ptrs, out, mask=d_mask)
 
 
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
