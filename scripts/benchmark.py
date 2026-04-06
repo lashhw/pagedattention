@@ -7,8 +7,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pagedattention_eager import flash_attn_with_kvcache_wrapper_eager
-from pagedattention_triton import flash_attn_with_kvcache_wrapper_triton
+from kernel_eager import flash_attn_with_kvcache_wrapper_eager
+from kernel_triton import flash_attn_with_kvcache_wrapper_triton
 
 
 def _parse_args():

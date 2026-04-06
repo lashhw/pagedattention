@@ -1,6 +1,6 @@
 import torch
 
-from pagedattention_common import _validate_decode_inputs
+from common import _validate_decode_inputs
 
 
 def _materialize_kvcache(k_cache, v_cache, cache_seqlens, block_table):

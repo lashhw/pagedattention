@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from pagedattention_common import _validate_decode_inputs
+from common import _validate_decode_inputs
 
 
 @triton.jit
