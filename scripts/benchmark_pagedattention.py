@@ -16,82 +16,61 @@ def _parse_args():
         description="Benchmark paged attention Triton vs eager implementations.",
     )
     parser.add_argument(
-        "--dtype",
-        choices=("float16", "bfloat16", "float32"),
-        default="bfloat16",
-        help="Input dtype for q/k/v tensors.",
-    )
-    parser.add_argument(
-        "--block-size",
+        "--block_size",
         type=int,
         default=16,
-        help="Block size for the paged KV cache.",
     )
     parser.add_argument(
-        "--head-size",
+        "--head_size",
         type=int,
         default=128,
-        help="Head dimension.",
     )
     parser.add_argument(
-        "--num-kv-heads",
+        "--num_kv_heads",
         type=int,
         default=8,
-        help="Number of KV heads.",
     )
     parser.add_argument(
-        "--num-kv-groups",
+        "--num_kv_groups",
         type=int,
         default=4,
-        help="Number of query head groups per KV head.",
     )
     parser.add_argument(
         "--seqlens",
-        type=str,
-        default="1000,7000,2000,4000,8000,5000,6000,3000",
-        help="Comma-separated per-head sequence lengths.",
+        type=int,
+        nargs="+",
+        default=[1000, 7000, 2000, 4000, 8000, 5000, 6000, 3000],
     )
     parser.add_argument(
         "--warmup",
         type=int,
         default=20,
-        help="Number of warmup iterations per implementation.",
     )
     parser.add_argument(
         "--iters",
         type=int,
         default=100,
-        help="Number of timed iterations per implementation.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed used to build the benchmark inputs.",
-    )
-    parser.add_argument(
-        "--skip-check",
-        action="store_true",
-        help="Skip the output correctness comparison.",
     )
     parser.add_argument(
         "--atol",
         type=float,
         default=2e-2,
-        help="Absolute tolerance used for correctness checking.",
     )
     parser.add_argument(
         "--rtol",
         type=float,
         default=2e-2,
-        help="Relative tolerance used for correctness checking.",
     )
     return parser.parse_args()
 
 
 def _build_decode_inputs(
     *,
-    dtype,
     block_size,
     head_size,
     num_kv_heads,
@@ -105,6 +84,7 @@ def _build_decode_inputs(
     torch.manual_seed(seed)
 
     device = "cuda"
+    dtype = torch.bfloat16
     num_query_heads = num_kv_heads * num_kv_groups
     blocks_per_head = [(seqlen + block_size - 1) // block_size for seqlen in seqlens]
     max_num_blocks_per_head = max(blocks_per_head)
@@ -115,16 +95,13 @@ def _build_decode_inputs(
     v_cache = torch.randn((num_blocks, block_size, head_size), device=device, dtype=dtype)
     cache_seqlens = torch.tensor([seqlens], device=device, dtype=torch.int32)
     block_table = torch.zeros((1, num_kv_heads, max_num_blocks_per_head), device=device, dtype=torch.int32)
+    physical_block_ids = torch.randperm(num_blocks, device=device, dtype=torch.int64).to(torch.int32)
 
-    next_block_id = 0
+    next_block_offset = 0
     for kv_head_idx, num_head_blocks in enumerate(blocks_per_head):
-        block_table[0, kv_head_idx, :num_head_blocks] = torch.arange(
-            next_block_id,
-            next_block_id + num_head_blocks,
-            device=device,
-            dtype=torch.int32,
-        )
-        next_block_id += num_head_blocks
+        head_block_ids = physical_block_ids[next_block_offset : next_block_offset + num_head_blocks]
+        block_table[0, kv_head_idx, :num_head_blocks] = head_block_ids
+        next_block_offset += num_head_blocks
 
     return q, k_cache, v_cache, cache_seqlens, block_table
 
@@ -134,35 +111,20 @@ def _benchmark(fn, *, warmup, iters, **kwargs):
         fn(**kwargs)
     torch.cuda.synchronize()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
-    for idx in range(iters):
-        start_events[idx].record()
+    start_event.record()
+    for _ in range(iters):
         fn(**kwargs)
-        end_events[idx].record()
+    end_event.record()
 
     torch.cuda.synchronize()
-    latencies_ms = [start.elapsed_time(end) for start, end in zip(start_events, end_events)]
-    avg_ms = sum(latencies_ms) / len(latencies_ms)
-    min_ms = min(latencies_ms)
-    max_ms = max(latencies_ms)
+    avg_ms = start_event.elapsed_time(end_event) / iters
 
     return {
         "avg_ms": avg_ms,
-        "min_ms": min_ms,
-        "max_ms": max_ms,
     }
-
-
-def _format_dtype(dtype):
-    if dtype == torch.float16:
-        return "float16"
-    if dtype == torch.bfloat16:
-        return "bfloat16"
-    if dtype == torch.float32:
-        return "float32"
-    return str(dtype)
 
 
 def main():
@@ -171,17 +133,12 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this benchmark.")
 
-    dtype = getattr(torch, args.dtype)
-    seqlens = [int(value) for value in args.seqlens.split(",") if value.strip()]
-    softmax_scale = 1.0 / math.sqrt(args.head_size)
-
     q, k_cache, v_cache, cache_seqlens, block_table = _build_decode_inputs(
-        dtype=dtype,
         block_size=args.block_size,
         head_size=args.head_size,
         num_kv_heads=args.num_kv_heads,
         num_kv_groups=args.num_kv_groups,
-        seqlens=seqlens,
+        seqlens=args.seqlens,
         seed=args.seed,
     )
 
@@ -191,7 +148,7 @@ def main():
         "v_cache": v_cache,
         "cache_seqlens": cache_seqlens,
         "block_table": block_table,
-        "softmax_scale": softmax_scale,
+        "softmax_scale": 1.0 / math.sqrt(args.head_size),
     }
 
     eager_out = flash_attn_with_kvcache_wrapper_eager(**common_kwargs)
@@ -199,10 +156,7 @@ def main():
     torch.cuda.synchronize()
 
     max_abs_diff = (triton_out - eager_out).abs().max().item()
-    check_status = "skipped"
-    if not args.skip_check:
-        torch.testing.assert_close(triton_out, eager_out, atol=args.atol, rtol=args.rtol)
-        check_status = "passed"
+    check_status = "passed" if torch.isclose(triton_out, eager_out, atol=args.atol, rtol=args.rtol).all() else "failed"
 
     eager_stats = _benchmark(
         flash_attn_with_kvcache_wrapper_eager,
@@ -221,29 +175,18 @@ def main():
 
     print("Paged attention benchmark")
     print(f"device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
-    print(f"dtype: {_format_dtype(dtype)}")
     print(
         "config: "
         f"block_size={args.block_size}, head_size={args.head_size}, "
         f"num_kv_heads={args.num_kv_heads}, num_kv_groups={args.num_kv_groups}"
     )
-    print(f"seqlens: {seqlens}")
+    print(f"seqlens: {args.seqlens}")
     print(f"warmup={args.warmup}, iters={args.iters}, correctness={check_status}, max_abs_diff={max_abs_diff:.6f}")
     print()
-    print(f"{'implementation':<16} {'avg_ms':>10} {'min_ms':>10} {'max_ms':>10}")
-    print(f"{'-' * 16} {'-' * 10} {'-' * 10} {'-' * 10}")
-    print(
-        f"{'eager':<16} "
-        f"{eager_stats['avg_ms']:>10.3f} "
-        f"{eager_stats['min_ms']:>10.3f} "
-        f"{eager_stats['max_ms']:>10.3f}"
-    )
-    print(
-        f"{'triton':<16} "
-        f"{triton_stats['avg_ms']:>10.3f} "
-        f"{triton_stats['min_ms']:>10.3f} "
-        f"{triton_stats['max_ms']:>10.3f}"
-    )
+    print(f"{'implementation':<16} {'avg_ms':>10}")
+    print(f"{'-' * 16} {'-' * 10}")
+    print(f"{'eager':<16} {eager_stats['avg_ms']:>10.3f}")
+    print(f"{'triton':<16} {triton_stats['avg_ms']:>10.3f}")
     print()
     print(f"speedup (eager / triton): {speedup:.2f}x")
 
