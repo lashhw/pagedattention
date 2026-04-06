@@ -4,9 +4,12 @@ import triton.language as tl
 
 from common import _validate_decode_inputs
 
+TARGET_BLOCKS_PER_SPLIT = 64
+MAX_SEQ_SPLITS = 8
+
 
 @triton.jit
-def _paged_attention_decode_kernel(
+def _paged_attention_decode_single_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -86,6 +89,194 @@ def _paged_attention_decode_kernel(
     tl.store(out_ptrs, out, mask=d_mask)
 
 
+@triton.jit
+def _paged_attention_decode_split_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    cache_seqlens_ptr,
+    block_table_ptr,
+    partial_m_ptr,
+    partial_l_ptr,
+    partial_acc_ptr,
+    num_kv_groups,
+    head_size,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_kt,
+    stride_kd,
+    stride_vb,
+    stride_vt,
+    stride_vd,
+    stride_sh,
+    stride_bh,
+    stride_bb,
+    stride_pmh,
+    stride_pms,
+    stride_plh,
+    stride_pls,
+    stride_pah,
+    stride_pas,
+    stride_pad,
+    softmax_scale,
+    TARGET_BLOCKS_PER_SPLIT: tl.constexpr,
+    MAX_SEQ_SPLITS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_head_idx = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    kv_head_idx = q_head_idx // num_kv_groups
+
+    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
+    num_blocks = tl.cdiv(seqlen, BLOCK_T)
+    num_seq_splits = tl.minimum(
+        MAX_SEQ_SPLITS,
+        tl.maximum(1, tl.cdiv(num_blocks, TARGET_BLOCKS_PER_SPLIT)),
+    )
+
+    if split_idx >= num_seq_splits:
+        return
+
+    blocks_per_split = tl.cdiv(num_blocks, num_seq_splits)
+    start_block = split_idx * blocks_per_split
+    end_block = tl.minimum(start_block + blocks_per_split, num_blocks)
+
+    t_offs = tl.arange(0, BLOCK_T)
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < head_size
+
+    q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
+    q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+
+    block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
+    k_block_offsets = t_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd
+    v_block_offsets = t_offs[:, None] * stride_vt + d_offs[None, :] * stride_vd
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for block_offset in tl.range(0, blocks_per_split):
+        logical_block_idx = start_block + block_offset
+        if logical_block_idx < end_block:
+            physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_bb)
+
+            token_offsets = logical_block_idx * BLOCK_T + t_offs
+            t_mask = token_offsets < seqlen
+            kv_mask = t_mask[:, None] & d_mask[None, :]
+
+            k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
+            k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
+            logits = tl.sum(k * q[None, :], axis=1) * softmax_scale
+            logits = tl.where(t_mask, logits, -float("inf"))
+
+            m_ij = tl.max(logits, axis=0)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+
+            p = tl.exp(logits - m_new)
+            p = tl.where(t_mask, p, 0.0)
+
+            v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
+            v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
+            m_i = m_new
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+
+    partial_m_ptrs = partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms
+    partial_l_ptrs = partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls
+    partial_acc_ptrs = partial_acc_ptr + q_head_idx * stride_pah + split_idx * stride_pas + d_offs * stride_pad
+
+    tl.store(partial_m_ptrs, m_i)
+    tl.store(partial_l_ptrs, l_i)
+    tl.store(partial_acc_ptrs, acc, mask=d_mask)
+
+
+@triton.jit
+def _paged_attention_decode_reduce_kernel(
+    partial_m_ptr,
+    partial_l_ptr,
+    partial_acc_ptr,
+    cache_seqlens_ptr,
+    out_ptr,
+    num_kv_groups,
+    head_size,
+    stride_sh,
+    stride_pmh,
+    stride_pms,
+    stride_plh,
+    stride_pls,
+    stride_pah,
+    stride_pas,
+    stride_pad,
+    stride_oh,
+    stride_od,
+    TARGET_BLOCKS_PER_SPLIT: tl.constexpr,
+    MAX_SEQ_SPLITS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_head_idx = tl.program_id(0)
+    kv_head_idx = q_head_idx // num_kv_groups
+
+    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
+    num_blocks = tl.cdiv(seqlen, BLOCK_T)
+    num_seq_splits = tl.minimum(
+        MAX_SEQ_SPLITS,
+        tl.maximum(1, tl.cdiv(num_blocks, TARGET_BLOCKS_PER_SPLIT)),
+    )
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < head_size
+
+    m = -float("inf")
+    for split_idx in tl.range(0, MAX_SEQ_SPLITS):
+        split_mask = split_idx < num_seq_splits
+        partial_l = tl.load(
+            partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls,
+            mask=split_mask,
+            other=0.0,
+        )
+        partial_m = tl.load(
+            partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms,
+            mask=split_mask,
+            other=-float("inf"),
+        )
+        partial_m = tl.where(partial_l > 0, partial_m, -float("inf"))
+        m = tl.maximum(m, partial_m)
+
+    out = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if m != -float("inf"):
+        l = 0.0
+        for split_idx in tl.range(0, MAX_SEQ_SPLITS):
+            split_mask = split_idx < num_seq_splits
+            partial_l = tl.load(
+                partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls,
+                mask=split_mask,
+                other=0.0,
+            )
+            partial_m = tl.load(
+                partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms,
+                mask=split_mask,
+                other=-float("inf"),
+            )
+            scale = tl.where(partial_l > 0, tl.exp(partial_m - m), 0.0)
+            partial_acc_ptrs = partial_acc_ptr + q_head_idx * stride_pah + split_idx * stride_pas + d_offs * stride_pad
+            partial_acc = tl.load(partial_acc_ptrs, mask=split_mask & d_mask, other=0.0)
+            l += partial_l * scale
+            out += partial_acc * scale
+
+        denom = tl.where(l > 0, l, 1.0)
+        out = out / denom
+
+    out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
+    tl.store(out_ptrs, out, mask=d_mask)
+
+
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
     num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
@@ -100,33 +291,102 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
     num_warps = 4
     num_stages = 1
 
-    _paged_attention_decode_kernel[grid](
-        q_heads,
-        k_cache,
-        v_cache,
-        cache_seqlens_heads,
-        block_table_heads,
-        out,
-        num_kv_groups,
-        head_size,
-        q_heads.stride(0),
-        q_heads.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        cache_seqlens_heads.stride(0),
-        block_table_heads.stride(0),
-        block_table_heads.stride(1),
-        out.stride(0),
-        out.stride(1),
-        softmax_scale,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    if block_table_heads.shape[1] <= TARGET_BLOCKS_PER_SPLIT:
+        _paged_attention_decode_single_kernel[grid](
+            q_heads,
+            k_cache,
+            v_cache,
+            cache_seqlens_heads,
+            block_table_heads,
+            out,
+            num_kv_groups,
+            head_size,
+            q_heads.stride(0),
+            q_heads.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            cache_seqlens_heads.stride(0),
+            block_table_heads.stride(0),
+            block_table_heads.stride(1),
+            out.stride(0),
+            out.stride(1),
+            softmax_scale,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    else:
+        partial_m = torch.empty((num_query_heads, MAX_SEQ_SPLITS), device=q.device, dtype=torch.float32)
+        partial_l = torch.empty((num_query_heads, MAX_SEQ_SPLITS), device=q.device, dtype=torch.float32)
+        partial_acc = torch.empty((num_query_heads, MAX_SEQ_SPLITS, block_d), device=q.device, dtype=torch.float32)
+
+        _paged_attention_decode_split_kernel[(num_query_heads, MAX_SEQ_SPLITS)](
+            q_heads,
+            k_cache,
+            v_cache,
+            cache_seqlens_heads,
+            block_table_heads,
+            partial_m,
+            partial_l,
+            partial_acc,
+            num_kv_groups,
+            head_size,
+            q_heads.stride(0),
+            q_heads.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            cache_seqlens_heads.stride(0),
+            block_table_heads.stride(0),
+            block_table_heads.stride(1),
+            partial_m.stride(0),
+            partial_m.stride(1),
+            partial_l.stride(0),
+            partial_l.stride(1),
+            partial_acc.stride(0),
+            partial_acc.stride(1),
+            partial_acc.stride(2),
+            softmax_scale,
+            TARGET_BLOCKS_PER_SPLIT=TARGET_BLOCKS_PER_SPLIT,
+            MAX_SEQ_SPLITS=MAX_SEQ_SPLITS,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        _paged_attention_decode_reduce_kernel[grid](
+            partial_m,
+            partial_l,
+            partial_acc,
+            cache_seqlens_heads,
+            out,
+            num_kv_groups,
+            head_size,
+            cache_seqlens_heads.stride(0),
+            partial_m.stride(0),
+            partial_m.stride(1),
+            partial_l.stride(0),
+            partial_l.stride(1),
+            partial_acc.stride(0),
+            partial_acc.stride(1),
+            partial_acc.stride(2),
+            out.stride(0),
+            out.stride(1),
+            TARGET_BLOCKS_PER_SPLIT=TARGET_BLOCKS_PER_SPLIT,
+            MAX_SEQ_SPLITS=MAX_SEQ_SPLITS,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
 
     return out.view(1, 1, num_query_heads, head_size)
