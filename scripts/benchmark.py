@@ -43,7 +43,7 @@ def _parse_args():
         "--seqlens",
         type=int,
         nargs="+",
-        default=[100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000],
+        default=[100000],
     )
     parser.add_argument(
         "--warmup",
@@ -130,6 +130,9 @@ def _benchmark(fn, warmup, iters, **kwargs):
 
 def main():
     args = _parse_args()
+
+    if len(args.seqlens) == 1:
+        args.seqlens = args.seqlens * args.num_kv_heads
 
     q, k_cache, v_cache, cache_seqlens, block_table = _build_decode_inputs(
         args.block_size,
