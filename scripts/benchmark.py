@@ -14,16 +14,6 @@ from kernel_triton import flash_attn_with_kvcache_wrapper_triton
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--block_size",
-        type=int,
-        default=16,
-    )
-    parser.add_argument(
-        "--head_size",
-        type=int,
-        default=128,
-    )
-    parser.add_argument(
         "--num_kv_heads",
         type=int,
         default=8,
@@ -32,6 +22,16 @@ def _parse_args():
         "--num_kv_groups",
         type=int,
         default=4,
+    )
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--head_size",
+        type=int,
+        default=128,
     )
     parser.add_argument(
         "--seqlens",
@@ -68,7 +68,6 @@ def _parse_args():
 
 
 def _build_decode_inputs(
-    *,
     block_size,
     head_size,
     num_kv_heads,
@@ -83,6 +82,7 @@ def _build_decode_inputs(
 
     device = "cuda"
     dtype = torch.bfloat16
+
     num_query_heads = num_kv_heads * num_kv_groups
     blocks_per_head = [(seqlen + block_size - 1) // block_size for seqlen in seqlens]
     max_num_blocks_per_head = max(blocks_per_head)
@@ -93,8 +93,8 @@ def _build_decode_inputs(
     v_cache = torch.randn((num_blocks, block_size, head_size), device=device, dtype=dtype)
     cache_seqlens = torch.tensor([seqlens], device=device, dtype=torch.int32)
     block_table = torch.zeros((1, num_kv_heads, max_num_blocks_per_head), device=device, dtype=torch.int32)
-    physical_block_ids = torch.randperm(num_blocks, device=device, dtype=torch.int64).to(torch.int32)
 
+    physical_block_ids = torch.randperm(num_blocks, device=device, dtype=torch.int32)
     next_block_offset = 0
     for kv_head_idx, num_head_blocks in enumerate(blocks_per_head):
         head_block_ids = physical_block_ids[next_block_offset : next_block_offset + num_head_blocks]
@@ -104,37 +104,34 @@ def _build_decode_inputs(
     return q, k_cache, v_cache, cache_seqlens, block_table
 
 
-def _benchmark(fn, *, warmup, iters, **kwargs):
+def _benchmark(fn, warmup, iters, **kwargs):
     for _ in range(warmup):
         fn(**kwargs)
-    torch.cuda.synchronize()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
+    torch.cuda.synchronize()
     start_event.record()
     for _ in range(iters):
         fn(**kwargs)
     end_event.record()
-
     torch.cuda.synchronize()
-    avg_ms = start_event.elapsed_time(end_event) / iters
 
-    return {
-        "avg_ms": avg_ms,
-    }
+    avg_ms = start_event.elapsed_time(end_event) / iters
+    return avg_ms
 
 
 def main():
     args = _parse_args()
 
     q, k_cache, v_cache, cache_seqlens, block_table = _build_decode_inputs(
-        block_size=args.block_size,
-        head_size=args.head_size,
-        num_kv_heads=args.num_kv_heads,
-        num_kv_groups=args.num_kv_groups,
-        seqlens=args.seqlens,
-        seed=args.seed,
+        args.block_size,
+        args.head_size,
+        args.num_kv_heads,
+        args.num_kv_groups,
+        args.seqlens,
+        args.seed,
     )
 
     common_kwargs = {
@@ -148,40 +145,38 @@ def main():
 
     eager_out = flash_attn_with_kvcache_wrapper_eager(**common_kwargs)
     triton_out = flash_attn_with_kvcache_wrapper_triton(**common_kwargs)
-    torch.cuda.synchronize()
 
     max_abs_diff = (triton_out - eager_out).abs().max().item()
     check_status = "passed" if torch.isclose(triton_out, eager_out, atol=args.atol, rtol=args.rtol).all() else "failed"
 
-    eager_stats = _benchmark(
+    eager_ms = _benchmark(
         flash_attn_with_kvcache_wrapper_eager,
-        warmup=args.warmup,
-        iters=args.iters,
+        args.warmup,
+        args.iters,
         **common_kwargs,
     )
-    triton_stats = _benchmark(
+    triton_ms = _benchmark(
         flash_attn_with_kvcache_wrapper_triton,
-        warmup=args.warmup,
-        iters=args.iters,
+        args.warmup,
+        args.iters,
         **common_kwargs,
     )
 
-    speedup = eager_stats["avg_ms"] / triton_stats["avg_ms"]
+    speedup = eager_ms / triton_ms
 
-    print("Paged attention benchmark")
     print(f"device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
     print(
         "config: "
-        f"block_size={args.block_size}, head_size={args.head_size}, "
-        f"num_kv_heads={args.num_kv_heads}, num_kv_groups={args.num_kv_groups}"
+        f"num_kv_heads={args.num_kv_heads}, num_kv_groups={args.num_kv_groups}, "
+        f"block_size={args.block_size}, head_size={args.head_size}"
     )
     print(f"seqlens: {args.seqlens}")
     print(f"warmup={args.warmup}, iters={args.iters}, correctness={check_status}, max_abs_diff={max_abs_diff:.6f}")
     print()
     print(f"{'implementation':<16} {'avg_ms':>10}")
     print(f"{'-' * 16} {'-' * 10}")
-    print(f"{'eager':<16} {eager_stats['avg_ms']:>10.3f}")
-    print(f"{'triton':<16} {triton_stats['avg_ms']:>10.3f}")
+    print(f"{'eager':<16} {eager_ms:>10.3f}")
+    print(f"{'triton':<16} {triton_ms:>10.3f}")
     print()
     print(f"speedup (eager / triton): {speedup:.2f}x")
 
