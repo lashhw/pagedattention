@@ -87,16 +87,16 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
 
     block_size = k_cache.shape[1]
     assert block_size == 16, "flash_attn_with_kvcache_wrapper_triton requires block_size == 16"
-    block_d = triton.next_power_of_2(head_size)
 
     q_heads = q[0, 0].contiguous()
     cache_seqlens_heads = cache_seqlens[0].contiguous()
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
-    num_warps = 2 if block_d <= 128 else 4
-
     grid = (num_query_heads,)
+    block_d = triton.next_power_of_2(head_size)
+    num_warps = 4
+
     _paged_attention_decode_kernel[grid](
         q_heads,
         k_cache,
