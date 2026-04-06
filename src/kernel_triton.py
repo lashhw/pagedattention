@@ -176,21 +176,30 @@ def flash_attn_with_kvcache_wrapper_triton(
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
+    assert num_splits > 0
+    assert block_table_heads.shape[1] > 0
+    num_splits = min(num_splits, block_table_heads.shape[1])
+
+    partial_m = torch.empty(
+        (num_query_heads, num_splits),
+        device=q.device, dtype=torch.float32
+    )
+    partial_l = torch.empty(
+        (num_query_heads, num_splits),
+        device=q.device, dtype=torch.float32
+    )
+    partial_acc = torch.empty(
+        (num_query_heads, num_splits, head_size),
+        device=q.device, dtype=torch.float32,
+    )
+
     grid = (num_query_heads,)
     block_t = k_cache.shape[1]
     block_d = triton.next_power_of_2(head_size)
     num_warps = 4
     num_stages = 1
-    effective_num_splits = max(1, min(num_splits, max(block_table_heads.shape[1], 1)))
-    partial_m = torch.empty((num_query_heads, effective_num_splits), device=q.device, dtype=torch.float32)
-    partial_l = torch.empty_like(partial_m)
-    partial_acc = torch.empty(
-        (num_query_heads, effective_num_splits, head_size),
-        device=q.device,
-        dtype=torch.float32,
-    )
 
-    split_grid = (num_query_heads, effective_num_splits)
+    split_grid = (num_query_heads, num_splits)
     _paged_attention_decode_split_kernel[split_grid](
         q_heads,
         k_cache,
@@ -202,7 +211,7 @@ def flash_attn_with_kvcache_wrapper_triton(
         partial_acc,
         num_kv_groups,
         head_size,
-        effective_num_splits,
+        num_splits,
         q_heads.stride(0),
         q_heads.stride(1),
         k_cache.stride(0),
@@ -234,7 +243,7 @@ def flash_attn_with_kvcache_wrapper_triton(
         partial_acc,
         out,
         head_size,
-        effective_num_splits,
+        num_splits,
         partial_m.stride(0),
         partial_m.stride(1),
         partial_l.stride(0),
