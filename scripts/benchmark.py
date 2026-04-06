@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from kernel_eager import flash_attn_with_kvcache_wrapper_eager
 from kernel_triton import flash_attn_with_kvcache_wrapper_triton
+from kernel_vllm import flash_attn_with_kvcache_wrapper_vllm
 
 
 def _parse_args():
@@ -151,9 +152,13 @@ def main():
 
     eager_out = flash_attn_with_kvcache_wrapper_eager(**common_kwargs)
     triton_out = flash_attn_with_kvcache_wrapper_triton(**common_kwargs)
+    vllm_out = flash_attn_with_kvcache_wrapper_vllm(**common_kwargs)
 
-    max_abs_diff = (triton_out - eager_out).abs().max().item()
-    check_status = "passed" if torch.isclose(triton_out, eager_out, atol=args.atol, rtol=args.rtol).all() else "failed"
+    triton_max_abs_diff = (triton_out - eager_out).abs().max().item()
+    triton_check_status = "passed" if torch.isclose(triton_out, eager_out, atol=args.atol, rtol=args.rtol).all() else "failed"
+
+    vllm_max_abs_diff = (vllm_out - eager_out).abs().max().item()
+    vllm_check_status = "passed" if torch.isclose(vllm_out, eager_out, atol=args.atol, rtol=args.rtol).all() else "failed"
 
     eager_ms = _benchmark(
         flash_attn_with_kvcache_wrapper_eager,
@@ -167,24 +172,42 @@ def main():
         args.iters,
         **common_kwargs,
     )
+    vllm_ms = _benchmark(
+        flash_attn_with_kvcache_wrapper_vllm,
+        args.warmup,
+        args.iters,
+        **common_kwargs,
+    )
 
-    speedup = eager_ms / triton_ms
+    triton_speedup = eager_ms / triton_ms
+    vllm_speedup = eager_ms / vllm_ms
 
     print(f"device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+    print("config:")
     print(
-        "config: "
-        f"num_kv_heads={args.num_kv_heads}, num_kv_groups={args.num_kv_groups}, "
-        f"block_size={args.block_size}, head_size={args.head_size}, num_splits={args.num_splits}"
+        f"  "
+        f"num_kv_heads={args.num_kv_heads}, "
+        f"num_kv_groups={args.num_kv_groups}, "
+        f"block_size={args.block_size}, "
+        f"head_size={args.head_size}, "
+        f"num_splits={args.num_splits}"
     )
-    print(f"seqlens: {args.seqlens}")
-    print(f"warmup={args.warmup}, iters={args.iters}, correctness={check_status}, max_abs_diff={max_abs_diff:.6f}")
+    print(f"  seqlens={args.seqlens}")
+    print(f"  warmup={args.warmup}, iters={args.iters}")
+    print(
+        "correctness: "
+        f"triton={triton_check_status} (max_abs_diff={triton_max_abs_diff:.6f}), "
+        f"vllm={vllm_check_status} (max_abs_diff={vllm_max_abs_diff:.6f})"
+    )
     print()
     print(f"{'implementation':<16} {'avg_ms':>10}")
     print(f"{'-' * 16} {'-' * 10}")
     print(f"{'eager':<16} {eager_ms:>10.3f}")
     print(f"{'triton':<16} {triton_ms:>10.3f}")
+    print(f"{'vllm':<16} {vllm_ms:>10.3f}")
     print()
-    print(f"speedup (eager / triton): {speedup:.2f}x")
+    print(f"speedup (eager / triton): {triton_speedup:.2f}x")
+    print(f"speedup (eager / vllm): {vllm_speedup:.2f}x")
 
 
 if __name__ == "__main__":
