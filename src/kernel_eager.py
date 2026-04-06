@@ -33,6 +33,7 @@ def flash_attn_with_kvcache_wrapper_eager(
     cache_seqlens,
     block_table,
     softmax_scale,
+    num_splits,
 ):
     _, num_kv_heads, num_kv_groups, _ = _validate_decode_inputs(q, cache_seqlens, block_table)
     q = q.transpose(1, 2).contiguous()
