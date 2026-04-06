@@ -29,15 +29,16 @@ def _paged_attention_decode_kernel(
     stride_oh,
     stride_od,
     softmax_scale,
+    BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     q_head_idx = tl.program_id(0)
     kv_head_idx = q_head_idx // num_kv_groups
 
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
-    num_blocks = tl.cdiv(seqlen, 16)
+    num_blocks = tl.cdiv(seqlen, BLOCK_T)
 
-    t_offs = tl.arange(0, 16)
+    t_offs = tl.arange(0, BLOCK_T)
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size
 
@@ -55,7 +56,7 @@ def _paged_attention_decode_kernel(
     for logical_block_idx in tl.range(0, num_blocks):
         physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_bb)
 
-        token_offsets = logical_block_idx * 16 + t_offs
+        token_offsets = logical_block_idx * BLOCK_T + t_offs
         t_mask = token_offsets < seqlen
         kv_mask = t_mask[:, None] & d_mask[None, :]
 
@@ -88,17 +89,16 @@ def _paged_attention_decode_kernel(
 def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale):
     num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
-    block_size = k_cache.shape[1]
-    assert block_size == 16, "flash_attn_with_kvcache_wrapper_triton requires block_size == 16"
-
     q_heads = q[0, 0].contiguous()
     cache_seqlens_heads = cache_seqlens[0].contiguous()
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
     grid = (num_query_heads,)
+    block_t = k_cache.shape[1]
     block_d = triton.next_power_of_2(head_size)
     num_warps = 4
+    num_stages = 1
 
     _paged_attention_decode_kernel[grid](
         q_heads,
@@ -123,9 +123,10 @@ def flash_attn_with_kvcache_wrapper_triton(q, k_cache, v_cache, cache_seqlens, b
         out.stride(0),
         out.stride(1),
         softmax_scale,
+        BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
     )
 
     return out.view(1, 1, num_query_heads, head_size)
