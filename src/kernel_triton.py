@@ -18,7 +18,7 @@ def _paged_attention_decode_split_kernel(
     partial_acc_ptr,
     num_kv_groups,
     head_size,
-    num_splits,
+    blocks_per_split,
     stride_qh,
     stride_qd,
     stride_kb,
@@ -47,10 +47,9 @@ def _paged_attention_decode_split_kernel(
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
     num_blocks = tl.cdiv(seqlen, BLOCK_T)
 
-    blocks_per_split = tl.cdiv(num_blocks, num_splits)
     start_block = split_idx * blocks_per_split
     end_block = tl.minimum(start_block + blocks_per_split, num_blocks)
-    num_blocks_in_split = end_block - start_block
+    num_blocks_in_split = tl.maximum(end_block - start_block, 0)
 
     t_offs = tl.arange(0, BLOCK_T)
     d_offs = tl.arange(0, BLOCK_D)
@@ -176,9 +175,10 @@ def flash_attn_with_kvcache_wrapper_triton(
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
-    assert num_splits > 0
-    assert block_table_heads.shape[1] > 0
-    num_splits = min(num_splits, block_table_heads.shape[1])
+    block_t = k_cache.shape[1]
+    global_max_seqlen = cache_seqlens_heads.max().item()
+    global_num_blocks = (global_max_seqlen + block_t - 1) // block_t
+    blocks_per_split = (global_num_blocks + num_splits - 1) // num_splits
 
     partial_m = torch.empty(
         (num_query_heads, num_splits),
@@ -194,7 +194,6 @@ def flash_attn_with_kvcache_wrapper_triton(
     )
 
     grid = (num_query_heads,)
-    block_t = k_cache.shape[1]
     block_d = triton.next_power_of_2(head_size)
     num_warps = 4
     num_stages = 1
@@ -212,7 +211,7 @@ def flash_attn_with_kvcache_wrapper_triton(
         partial_acc,
         num_kv_groups,
         head_size,
-        num_splits,
+        blocks_per_split,
         q_heads.stride(0),
         q_heads.stride(1),
         k_cache.stride(0),
