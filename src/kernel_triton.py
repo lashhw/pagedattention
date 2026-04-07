@@ -5,6 +5,43 @@ import triton.language as tl
 from common import _validate_decode_inputs
 
 
+def _ceil_div(numer, denom):
+    return (numer + denom - 1) // denom
+
+
+def _build_chunk_worklist(num_blocks_per_head, num_splits, device):
+    if num_splits <= 0:
+        raise ValueError(f"Expected num_splits > 0, got {num_splits}")
+
+    num_blocks_per_head_host = num_blocks_per_head.cpu().tolist()
+    num_kv_heads = len(num_blocks_per_head_host)
+    total_blocks = sum(num_blocks_per_head_host)
+    target_chunk_count = num_kv_heads * num_splits
+    blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
+
+    chunk_offsets = [0]
+    chunk_kv_heads = []
+    chunk_start_blocks = []
+    chunk_num_blocks = []
+
+    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head_host):
+        num_chunks = _ceil_div(num_blocks, blocks_per_chunk)
+        for chunk_idx in range(num_chunks):
+            start_block = chunk_idx * blocks_per_chunk
+            live_blocks = min(blocks_per_chunk, num_blocks - start_block)
+            chunk_kv_heads.append(kv_head_idx)
+            chunk_start_blocks.append(start_block)
+            chunk_num_blocks.append(live_blocks)
+        chunk_offsets.append(len(chunk_kv_heads))
+
+    return (
+        torch.tensor(chunk_offsets, device=device, dtype=torch.int32),
+        torch.tensor(chunk_kv_heads, device=device, dtype=torch.int32),
+        torch.tensor(chunk_start_blocks, device=device, dtype=torch.int32),
+        torch.tensor(chunk_num_blocks, device=device, dtype=torch.int32),
+    )
+
+
 @triton.jit
 def _paged_attention_decode_split_kernel(
     q_ptr,
@@ -12,13 +49,15 @@ def _paged_attention_decode_split_kernel(
     v_cache_ptr,
     cache_seqlens_ptr,
     block_table_ptr,
+    chunk_kv_head_ptr,
+    chunk_start_block_ptr,
+    chunk_num_blocks_ptr,
     softmax_scale,
     partial_m_ptr,
     partial_l_ptr,
     partial_acc_ptr,
     num_kv_groups,
     head_size,
-    blocks_per_split,
     stride_qh,
     stride_qd,
     stride_kb,
@@ -30,26 +69,24 @@ def _paged_attention_decode_split_kernel(
     stride_sh,
     stride_bh,
     stride_bb,
-    stride_pmh,
-    stride_pms,
-    stride_plh,
-    stride_pls,
-    stride_pah,
-    stride_pas,
+    stride_pmc,
+    stride_pmg,
+    stride_plc,
+    stride_plg,
+    stride_pac,
+    stride_pag,
     stride_pad,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    q_head_idx = tl.program_id(0)
-    split_idx = tl.program_id(1)
-    kv_head_idx = q_head_idx // num_kv_groups
+    chunk_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+    kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
 
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
-    num_blocks = tl.cdiv(seqlen, BLOCK_T)
-
-    start_block = split_idx * blocks_per_split
-    end_block = tl.minimum(start_block + blocks_per_split, num_blocks)
-    num_blocks_in_split = tl.maximum(end_block - start_block, 0)
+    start_block = tl.load(chunk_start_block_ptr + chunk_idx)
+    num_blocks_in_chunk = tl.load(chunk_num_blocks_ptr + chunk_idx)
 
     t_offs = tl.arange(0, BLOCK_T)
     d_offs = tl.arange(0, BLOCK_D)
@@ -66,8 +103,8 @@ def _paged_attention_decode_split_kernel(
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    for split_block_offset in tl.range(0, num_blocks_in_split):
-        logical_block_idx = start_block + split_block_offset
+    for chunk_block_offset in tl.range(0, num_blocks_in_chunk):
+        logical_block_idx = start_block + chunk_block_offset
         physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_bb)
 
         token_offsets = logical_block_idx * BLOCK_T + t_offs
@@ -97,9 +134,9 @@ def _paged_attention_decode_split_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=0)
         acc = acc * alpha + pv
 
-    partial_m_ptrs = partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms
-    partial_l_ptrs = partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls
-    partial_acc_ptrs = partial_acc_ptr + q_head_idx * stride_pah + split_idx * stride_pas + d_offs * stride_pad
+    partial_m_ptrs = partial_m_ptr + chunk_idx * stride_pmc + group_idx * stride_pmg
+    partial_l_ptrs = partial_l_ptr + chunk_idx * stride_plc + group_idx * stride_plg
+    partial_acc_ptrs = partial_acc_ptr + chunk_idx * stride_pac + group_idx * stride_pag + d_offs * stride_pad
 
     tl.store(partial_m_ptrs, m_i)
     tl.store(partial_l_ptrs, l_i)
@@ -108,24 +145,31 @@ def _paged_attention_decode_split_kernel(
 
 @triton.jit
 def _paged_attention_decode_reduce_kernel(
+    chunk_offsets_ptr,
     partial_m_ptr,
     partial_l_ptr,
     partial_acc_ptr,
     out_ptr,
+    num_kv_groups,
     head_size,
-    num_splits,
-    stride_pmh,
-    stride_pms,
-    stride_plh,
-    stride_pls,
-    stride_pah,
-    stride_pas,
+    stride_pmc,
+    stride_pmg,
+    stride_plc,
+    stride_plg,
+    stride_pac,
+    stride_pag,
     stride_pad,
     stride_oh,
     stride_od,
     BLOCK_D: tl.constexpr,
 ):
-    q_head_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
+
+    start_chunk = tl.load(chunk_offsets_ptr + kv_head_idx)
+    end_chunk = tl.load(chunk_offsets_ptr + kv_head_idx + 1)
+    num_chunks = end_chunk - start_chunk
 
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size
@@ -134,10 +178,11 @@ def _paged_attention_decode_reduce_kernel(
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    for split_idx in tl.range(0, num_splits):
-        partial_m = tl.load(partial_m_ptr + q_head_idx * stride_pmh + split_idx * stride_pms)
-        partial_l = tl.load(partial_l_ptr + q_head_idx * stride_plh + split_idx * stride_pls)
-        partial_acc_ptrs = partial_acc_ptr + q_head_idx * stride_pah + split_idx * stride_pas + d_offs * stride_pad
+    for chunk_offset in tl.range(0, num_chunks):
+        chunk_idx = start_chunk + chunk_offset
+        partial_m = tl.load(partial_m_ptr + chunk_idx * stride_pmc + group_idx * stride_pmg)
+        partial_l = tl.load(partial_l_ptr + chunk_idx * stride_plc + group_idx * stride_plg)
+        partial_acc_ptrs = partial_acc_ptr + chunk_idx * stride_pac + group_idx * stride_pag + d_offs * stride_pad
         partial_acc = tl.load(partial_acc_ptrs, mask=d_mask, other=0.0)
 
         has_acc = l_i > 0
@@ -178,43 +223,48 @@ def flash_attn_with_kvcache_wrapper_triton(
     out = torch.empty_like(q_heads)
 
     block_t = k_cache.shape[1]
-    num_blocks_per_head = (cache_seqlens_heads + block_t - 1) // block_t
-    mean_num_blocks = (num_blocks_per_head.sum().item() + num_kv_heads - 1) // num_kv_heads
-    blocks_per_split = (mean_num_blocks + num_splits - 1) // num_splits
-    num_splits = (num_blocks_per_head.max().item() + blocks_per_split - 1) // blocks_per_split
+    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t)
+    chunk_offsets, chunk_kv_heads, chunk_start_blocks, chunk_num_blocks = _build_chunk_worklist(
+        num_blocks_per_head, num_splits, q.device,
+    )
+    total_live_chunks = chunk_kv_heads.numel()
+
+    if total_live_chunks == 0:
+        return out.zero_().view(1, 1, num_query_heads, head_size)
 
     partial_m = torch.empty(
-        (num_query_heads, num_splits),
+        (total_live_chunks, num_kv_groups),
         device=q.device, dtype=torch.float32
     )
     partial_l = torch.empty(
-        (num_query_heads, num_splits),
+        (total_live_chunks, num_kv_groups),
         device=q.device, dtype=torch.float32
     )
     partial_acc = torch.empty(
-        (num_query_heads, num_splits, head_size),
+        (total_live_chunks, num_kv_groups, head_size),
         device=q.device, dtype=torch.float32
     )
 
-    grid = (num_query_heads,)
     block_d = triton.next_power_of_2(head_size)
     num_warps = 4
     num_stages = 1
 
-    split_grid = (num_query_heads, num_splits)
+    split_grid = (total_live_chunks, num_kv_groups)
     _paged_attention_decode_split_kernel[split_grid](
         q_heads,
         k_cache,
         v_cache,
         cache_seqlens_heads,
         block_table_heads,
+        chunk_kv_heads,
+        chunk_start_blocks,
+        chunk_num_blocks,
         softmax_scale,
         partial_m,
         partial_l,
         partial_acc,
         num_kv_groups,
         head_size,
-        blocks_per_split,
         q_heads.stride(0),
         q_heads.stride(1),
         k_cache.stride(0),
@@ -239,13 +289,15 @@ def flash_attn_with_kvcache_wrapper_triton(
         num_stages=num_stages,
     )
 
-    _paged_attention_decode_reduce_kernel[grid](
+    reduce_grid = (num_kv_heads, num_kv_groups)
+    _paged_attention_decode_reduce_kernel[reduce_grid](
+        chunk_offsets,
         partial_m,
         partial_l,
         partial_acc,
         out,
+        num_kv_groups,
         head_size,
-        num_splits,
         partial_m.stride(0),
         partial_m.stride(1),
         partial_l.stride(0),
