@@ -186,7 +186,7 @@ def flash_attn_with_kvcache_wrapper_triton(
     block_table,
     softmax_scale,
     num_splits=1,
-    block_n=64,
+    block_n=128,
     num_warps=4,
     num_stages=1,
 ):
