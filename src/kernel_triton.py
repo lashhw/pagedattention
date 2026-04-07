@@ -167,7 +167,7 @@ def flash_attn_with_kvcache_wrapper_triton(
     softmax_scale,
     num_splits,
 ):
-    num_query_heads, _, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
+    num_query_heads, num_kv_heads, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
         raise TypeError("This kernel only supports BF16 inputs for q, k_cache, and v_cache.")
@@ -178,9 +178,10 @@ def flash_attn_with_kvcache_wrapper_triton(
     out = torch.empty_like(q_heads)
 
     block_t = k_cache.shape[1]
-    global_max_seqlen = cache_seqlens_heads.max().item()
-    global_num_blocks = (global_max_seqlen + block_t - 1) // block_t
-    blocks_per_split = (global_num_blocks + num_splits - 1) // num_splits
+    num_blocks_per_head = (cache_seqlens_heads + block_t - 1) // block_t
+    mean_num_blocks = (num_blocks_per_head.sum().item() + num_kv_heads - 1) // num_kv_heads
+    blocks_per_split = (mean_num_blocks + num_splits - 1) // num_splits
+    num_splits = (num_blocks_per_head.max().item() + blocks_per_split - 1) // blocks_per_split
 
     partial_m = torch.empty(
         (num_query_heads, num_splits),
