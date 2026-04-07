@@ -189,7 +189,10 @@ def flash_attn_with_kvcache_wrapper_triton(
     cache_seqlens,
     block_table,
     softmax_scale,
-    num_splits,
+    num_splits=1,
+    block_n=64,
+    num_warps=4,
+    num_stages=1,
 ):
     num_query_heads, num_kv_heads, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
 
@@ -201,10 +204,10 @@ def flash_attn_with_kvcache_wrapper_triton(
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
-    block_n = 64
     block_t = k_cache.shape[1]
-    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t).cpu().tolist()
+    block_d = triton.next_power_of_2(head_size)
 
+    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t).cpu().tolist()
     total_blocks = sum(num_blocks_per_head)
     target_chunk_count = num_kv_heads * num_splits
     blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
@@ -245,10 +248,6 @@ def flash_attn_with_kvcache_wrapper_triton(
         (total_live_chunks, num_kv_groups, head_size),
         dtype=torch.float32, device=q.device
     )
-
-    block_d = triton.next_power_of_2(head_size)
-    num_warps = 4
-    num_stages = 1
 
     split_grid = (total_live_chunks, num_kv_groups)
     _paged_attention_decode_split_kernel[split_grid](
