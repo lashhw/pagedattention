@@ -69,14 +69,16 @@ def _paged_attention_decode_split_kernel(
     block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
     k_block_offsets = t_offs[None, :, None] * stride_kt + d_offs[None, None, :] * stride_kd
     v_block_offsets = t_offs[None, :, None] * stride_vt + d_offs[None, None, :] * stride_vd
+
     m_i = -float("inf")
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for chunk_block_offset in tl.range(0, num_blocks_in_chunk, BLOCKS_PER_STEP):
         live_block_offs = chunk_block_offset + block_offs
-        block_mask = live_block_offs < num_blocks_in_chunk
         logical_block_idxs = start_block + live_block_offs
+        block_mask = live_block_offs < num_blocks_in_chunk
+
         physical_block_ptrs = block_table_head_ptr + logical_block_idxs * stride_bb
         physical_block_idxs = tl.load(physical_block_ptrs, mask=block_mask, other=0)
 
@@ -151,8 +153,7 @@ def _paged_attention_decode_reduce_kernel(
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    for chunk_offset in tl.range(0, num_chunks):
-        chunk_idx = start_chunk + chunk_offset
+    for chunk_idx in tl.range(start_chunk, end_chunk):
         partial_m = tl.load(partial_m_ptr + chunk_idx * stride_pmc + group_idx * stride_pmg)
         partial_l = tl.load(partial_l_ptr + chunk_idx * stride_plc + group_idx * stride_plg)
         partial_acc_ptrs = partial_acc_ptr + chunk_idx * stride_pac + group_idx * stride_pag + d_offs * stride_pad
@@ -229,9 +230,6 @@ def flash_attn_with_kvcache_wrapper_triton(
     chunk_num_blocks = torch.tensor(chunk_num_blocks, dtype=torch.int32, device=q.device)
 
     total_live_chunks = chunk_kv_heads.numel()
-    if total_live_chunks == 0:
-        return out.zero_().view(1, 1, num_query_heads, head_size)
-
     partial_m = torch.empty(
         (total_live_chunks, num_kv_groups),
         dtype=torch.float32, device=q.device
