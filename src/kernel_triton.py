@@ -144,17 +144,13 @@ def _paged_attention_decode_reduce_kernel(
         has_partial = partial_l > 0
         has_both = has_acc & has_partial
 
-        m_new = tl.where(
-            has_both,
-            tl.maximum(m_i, partial_m),
-            tl.where(has_acc, m_i, tl.where(has_partial, partial_m, 0.0)),
-        )
+        m_new = tl.maximum(m_i, partial_m)
         alpha = tl.where(has_both, tl.exp(m_i - m_new), tl.where(has_acc, 1.0, 0.0))
         beta = tl.where(has_both, tl.exp(partial_m - m_new), tl.where(has_partial, 1.0, 0.0))
 
+        m_i = m_new
         l_i = l_i * alpha + partial_l * beta
         acc = acc * alpha + partial_acc * beta
-        m_i = tl.where(has_partial, m_new, m_i)
 
     denom = tl.where(l_i > 0, l_i, 1.0)
     out = acc / denom
