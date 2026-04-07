@@ -49,17 +49,16 @@ def _paged_attention_decode_split_kernel(
     chunk_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
 
-    kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
-    q_head_idx = kv_head_idx * num_kv_groups + group_idx
-
-    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
-    start_block = tl.load(chunk_start_block_ptr + chunk_idx)
-    num_blocks_in_chunk = tl.load(chunk_num_blocks_ptr + chunk_idx)
-
     t_offs = tl.arange(0, BLOCK_T)
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size
 
+    kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
+    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
+    start_block = tl.load(chunk_start_block_ptr + chunk_idx)
+    num_blocks_in_chunk = tl.load(chunk_num_blocks_ptr + chunk_idx)
+
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
     q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
     q_bf16 = tl.load(q_ptrs, mask=d_mask, other=0.0)
 
@@ -134,12 +133,12 @@ def _paged_attention_decode_reduce_kernel(
     kv_head_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
 
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < head_size
+
     start_chunk = tl.load(chunk_offsets_ptr + kv_head_idx)
     end_chunk = tl.load(chunk_offsets_ptr + kv_head_idx + 1)
     num_chunks = end_chunk - start_chunk
-
-    d_offs = tl.arange(0, BLOCK_D)
-    d_mask = d_offs < head_size
 
     m_i = -float("inf")
     l_i = 0.0
