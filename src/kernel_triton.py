@@ -48,6 +48,7 @@ def _paged_attention_decode_split_kernel(
 ):
     chunk_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
+
     kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
     q_head_idx = kv_head_idx * num_kv_groups + group_idx
 
@@ -132,7 +133,6 @@ def _paged_attention_decode_reduce_kernel(
 ):
     kv_head_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
-    q_head_idx = kv_head_idx * num_kv_groups + group_idx
 
     start_chunk = tl.load(chunk_offsets_ptr + kv_head_idx)
     end_chunk = tl.load(chunk_offsets_ptr + kv_head_idx + 1)
@@ -164,9 +164,11 @@ def _paged_attention_decode_reduce_kernel(
         l_i = l_i * alpha + partial_l * beta
         acc = acc * alpha + partial_acc * beta
 
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
+    out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
+
     denom = tl.where(l_i > 0, l_i, 1.0)
     out = acc / denom
-    out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
     tl.store(out_ptrs, out, mask=d_mask)
 
 
@@ -190,11 +192,9 @@ def flash_attn_with_kvcache_wrapper_triton(
     out = torch.empty_like(q_heads)
 
     block_t = k_cache.shape[1]
-    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t)
+    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t).cpu().tolist()
 
-    num_blocks_per_head_host = num_blocks_per_head.cpu().tolist()
-    num_kv_heads = len(num_blocks_per_head_host)
-    total_blocks = sum(num_blocks_per_head_host)
+    total_blocks = sum(num_blocks_per_head)
     target_chunk_count = num_kv_heads * num_splits
     blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
 
@@ -203,7 +203,7 @@ def flash_attn_with_kvcache_wrapper_triton(
     chunk_start_blocks = []
     chunk_num_blocks = []
 
-    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head_host):
+    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head):
         num_chunks = _ceil_div(num_blocks, blocks_per_chunk)
         for chunk_idx in range(num_chunks):
             start_block = chunk_idx * blocks_per_chunk
