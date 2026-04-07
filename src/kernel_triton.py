@@ -54,11 +54,12 @@ def _paged_attention_decode_split_kernel(
     d_mask = d_offs < head_size
 
     kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
+
     seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
     start_block = tl.load(chunk_start_block_ptr + chunk_idx)
     num_blocks_in_chunk = tl.load(chunk_num_blocks_ptr + chunk_idx)
 
-    q_head_idx = kv_head_idx * num_kv_groups + group_idx
     q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
     q_bf16 = tl.load(q_ptrs, mask=d_mask, other=0.0)
 
