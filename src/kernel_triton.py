@@ -147,7 +147,6 @@ def _paged_attention_decode_reduce_kernel(
 
     start_chunk = tl.load(chunk_offsets_ptr + kv_head_idx)
     end_chunk = tl.load(chunk_offsets_ptr + kv_head_idx + 1)
-    num_chunks = end_chunk - start_chunk
 
     m_i = -float("inf")
     l_i = 0.0
