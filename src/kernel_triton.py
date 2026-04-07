@@ -9,39 +9,6 @@ def _ceil_div(numer, denom):
     return (numer + denom - 1) // denom
 
 
-def _build_chunk_worklist(num_blocks_per_head, num_splits, device):
-    if num_splits <= 0:
-        raise ValueError(f"Expected num_splits > 0, got {num_splits}")
-
-    num_blocks_per_head_host = num_blocks_per_head.cpu().tolist()
-    num_kv_heads = len(num_blocks_per_head_host)
-    total_blocks = sum(num_blocks_per_head_host)
-    target_chunk_count = num_kv_heads * num_splits
-    blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
-
-    chunk_offsets = [0]
-    chunk_kv_heads = []
-    chunk_start_blocks = []
-    chunk_num_blocks = []
-
-    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head_host):
-        num_chunks = _ceil_div(num_blocks, blocks_per_chunk)
-        for chunk_idx in range(num_chunks):
-            start_block = chunk_idx * blocks_per_chunk
-            live_blocks = min(blocks_per_chunk, num_blocks - start_block)
-            chunk_kv_heads.append(kv_head_idx)
-            chunk_start_blocks.append(start_block)
-            chunk_num_blocks.append(live_blocks)
-        chunk_offsets.append(len(chunk_kv_heads))
-
-    return (
-        torch.tensor(chunk_offsets, device=device, dtype=torch.int32),
-        torch.tensor(chunk_kv_heads, device=device, dtype=torch.int32),
-        torch.tensor(chunk_start_blocks, device=device, dtype=torch.int32),
-        torch.tensor(chunk_num_blocks, device=device, dtype=torch.int32),
-    )
-
-
 @triton.jit
 def _paged_attention_decode_split_kernel(
     q_ptr,
@@ -224,25 +191,48 @@ def flash_attn_with_kvcache_wrapper_triton(
 
     block_t = k_cache.shape[1]
     num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t)
-    chunk_offsets, chunk_kv_heads, chunk_start_blocks, chunk_num_blocks = _build_chunk_worklist(
-        num_blocks_per_head, num_splits, q.device,
-    )
-    total_live_chunks = chunk_kv_heads.numel()
 
+    num_blocks_per_head_host = num_blocks_per_head.cpu().tolist()
+    num_kv_heads = len(num_blocks_per_head_host)
+    total_blocks = sum(num_blocks_per_head_host)
+    target_chunk_count = num_kv_heads * num_splits
+    blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
+
+    chunk_offsets = [0]
+    chunk_kv_heads = []
+    chunk_start_blocks = []
+    chunk_num_blocks = []
+
+    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head_host):
+        num_chunks = _ceil_div(num_blocks, blocks_per_chunk)
+        for chunk_idx in range(num_chunks):
+            start_block = chunk_idx * blocks_per_chunk
+            live_blocks = min(blocks_per_chunk, num_blocks - start_block)
+            chunk_kv_heads.append(kv_head_idx)
+            chunk_start_blocks.append(start_block)
+            chunk_num_blocks.append(live_blocks)
+        chunk_offsets.append(len(chunk_kv_heads))
+
+    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device=q.device)
+    chunk_kv_heads = torch.tensor(chunk_kv_heads, dtype=torch.int32, device=q.device)
+    chunk_start_blocks = torch.tensor(chunk_start_blocks, dtype=torch.int32, device=q.device)
+    chunk_num_blocks = torch.tensor(chunk_num_blocks, dtype=torch.int32, device=q.device)
+
+    total_live_chunks = chunk_kv_heads.numel()
     if total_live_chunks == 0:
         return out.zero_().view(1, 1, num_query_heads, head_size)
 
     partial_m = torch.empty(
         (total_live_chunks, num_kv_groups),
-        device=q.device, dtype=torch.float32
+        dtype=torch.float32, device=q.device
     )
     partial_l = torch.empty(
         (total_live_chunks, num_kv_groups),
-        device=q.device, dtype=torch.float32
+        dtype=torch.float32, device=q.device
     )
     partial_acc = torch.empty(
         (total_live_chunks, num_kv_groups, head_size),
-        device=q.device, dtype=torch.float32
+        dtype=torch.float32, device=q.device
     )
 
     block_d = triton.next_power_of_2(head_size)
