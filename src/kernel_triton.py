@@ -43,12 +43,17 @@ def _paged_attention_decode_split_kernel(
     stride_pac,
     stride_pag,
     stride_pad,
+    BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     chunk_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
 
+    tl.static_assert(BLOCK_N % BLOCK_T == 0, "BLOCK_N must be divisible by BLOCK_T.")
+    BLOCKS_PER_STEP: tl.constexpr = BLOCK_N // BLOCK_T
+
+    block_offs = tl.arange(0, BLOCKS_PER_STEP)
     t_offs = tl.arange(0, BLOCK_T)
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size
@@ -64,24 +69,28 @@ def _paged_attention_decode_split_kernel(
     q_bf16 = tl.load(q_ptrs, mask=d_mask, other=0.0)
 
     block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
-    k_block_offsets = t_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd
-    v_block_offsets = t_offs[:, None] * stride_vt + d_offs[None, :] * stride_vd
-
+    k_block_offsets = t_offs[None, :, None] * stride_kt + d_offs[None, None, :] * stride_kd
+    v_block_offsets = t_offs[None, :, None] * stride_vt + d_offs[None, None, :] * stride_vd
     m_i = -float("inf")
     l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    for chunk_block_offset in tl.range(0, num_blocks_in_chunk):
-        logical_block_idx = start_block + chunk_block_offset
-        physical_block_idx = tl.load(block_table_head_ptr + logical_block_idx * stride_bb)
+    for chunk_block_offset in tl.range(0, num_blocks_in_chunk, BLOCKS_PER_STEP):
+        live_block_offs = chunk_block_offset + block_offs
+        block_mask = live_block_offs < num_blocks_in_chunk
+        logical_block_idxs = start_block + live_block_offs
+        physical_block_ptrs = block_table_head_ptr + logical_block_idxs * stride_bb
+        physical_block_idxs = tl.load(physical_block_ptrs, mask=block_mask, other=0)
 
-        token_offsets = logical_block_idx * BLOCK_T + t_offs
-        t_mask = token_offsets < seqlen
-        kv_mask = t_mask[:, None] & d_mask[None, :]
+        token_offsets = logical_block_idxs[:, None] * BLOCK_T + t_offs[None, :]
+        t_mask = block_mask[:, None] & (token_offsets < seqlen)
+        kv_mask = t_mask[:, :, None] & d_mask[None, None, :]
 
-        k_ptrs = k_cache_ptr + physical_block_idx * stride_kb + k_block_offsets
+        k_ptrs = k_cache_ptr + physical_block_idxs[:, None, None] * stride_kb + k_block_offsets
         k_bf16 = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+        k_bf16 = tl.reshape(k_bf16, BLOCK_N, BLOCK_D)
 
+        t_mask = tl.reshape(t_mask, BLOCK_N)
         logits = tl.sum(q_bf16[None, :] * k_bf16, axis=1, dtype=tl.float32) * softmax_scale
         logits = tl.where(t_mask, logits, -float("inf"))
 
@@ -92,8 +101,9 @@ def _paged_attention_decode_split_kernel(
         p = tl.exp(logits - m_new)
         p = tl.where(t_mask, p, 0.0)
 
-        v_ptrs = v_cache_ptr + physical_block_idx * stride_vb + v_block_offsets
+        v_ptrs = v_cache_ptr + physical_block_idxs[:, None, None] * stride_vb + v_block_offsets
         v_bf16 = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+        v_bf16 = tl.reshape(v_bf16, BLOCK_N, BLOCK_D)
 
         p_bf16 = p.to(tl.bfloat16)
         pv = tl.sum(p_bf16[:, None] * v_bf16, axis=0, dtype=tl.float32)
@@ -191,6 +201,7 @@ def flash_attn_with_kvcache_wrapper_triton(
     block_table_heads = block_table[0].contiguous()
     out = torch.empty_like(q_heads)
 
+    block_n = 64
     block_t = k_cache.shape[1]
     num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t).cpu().tolist()
 
@@ -273,6 +284,7 @@ def flash_attn_with_kvcache_wrapper_triton(
         partial_acc.stride(0),
         partial_acc.stride(1),
         partial_acc.stride(2),
+        BLOCK_N=block_n,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=num_warps,
