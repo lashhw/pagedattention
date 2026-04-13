@@ -5,10 +5,6 @@ import triton.language as tl
 from common import _validate_decode_inputs
 
 
-def _ceil_div(numer, denom):
-    return (numer + denom - 1) // denom
-
-
 @triton.jit
 def _paged_attention_decode_split_kernel(
     q_ptr,
@@ -176,6 +172,10 @@ def _paged_attention_decode_reduce_kernel(
     denom = tl.where(l_i > 0, l_i, 1.0)
     out = acc / denom
     tl.store(out_ptrs, out)
+
+
+def _ceil_div(numer, denom):
+    return (numer + denom - 1) // denom
 
 
 def flash_attn_with_kvcache_wrapper_triton(
