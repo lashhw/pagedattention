@@ -76,7 +76,7 @@ def _paged_attention_decode_split_kernel(
         block_mask = live_block_offs < num_blocks_in_chunk
 
         physical_block_ptrs = block_table_head_ptr + logical_block_idxs * stride_bb
-        physical_block_idxs = tl.load(physical_block_ptrs, mask=block_mask, other=0)
+        physical_block_idxs = tl.load(physical_block_ptrs, mask=block_mask, other=0).to(tl.int64)
 
         token_offsets = logical_block_idxs[:, None] * BLOCK_T + t_offs[None, :]
         t_mask = block_mask[:, None] & (token_offsets < seqlen)
